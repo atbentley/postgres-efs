@@ -10,7 +10,7 @@ def read(path):
 
 
 _version_re = re.compile(r'\s*__version__\s*=\s*\'(.*)\'\s*')
-version = _version_re.findall(read('pefs.py'))[0]
+version = _version_re.findall(read('pefs/__init__.py'))[0]
 
 
 install_requires = read('requirements.txt').split('\n')
@@ -26,7 +26,7 @@ setup(
     author_email='andrew.t.bentley@gmail.com',
     description='Store Postgres databases on Amazon elastic file systems.',
     long_description=read('README.rst'),
-    py_modules=['pefs'],
+    packages=['pefs'],
     include_package_data=True,
     zip_safe=False,
     platforms='any',
