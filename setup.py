@@ -28,6 +28,10 @@ setup(
     long_description=read('README.rst'),
     packages=['pefs'],
     include_package_data=True,
+    entry_points='''
+        [console_scripts]
+        pefs=pefs.cli:cli
+    ''',
     zip_safe=False,
     platforms='any',
     install_requires=install_requires,
