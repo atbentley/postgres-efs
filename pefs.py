@@ -2,6 +2,9 @@ import shutil
 import subprocess
 
 import sys
+from contextlib import contextmanager
+
+import time
 
 import os
 
@@ -11,121 +14,136 @@ import pg8000
 __version__ = '0.0.1'
 
 
-def get_pgdata(connection):
-    cursor = connection.cursor()
-    cursor.execute('show data_directory')
-    return cursor.fetchone()[0]
-
-
-def get_db_oid(db_name, connection):
-    cursor = connection.cursor()
-    cursor.execute('select oid from pg_database where datname=:db', {'db': db_name})
-    return cursor.fetchone()[0]
-
-
-def get_schema_oid(schema_name, connection):
-    cursor = connection.cursor()
-    cursor.execute('select oid from pg_namespace where nspname=:schema', {'schema': schema_name})
-    return cursor.fetchone()[0]
-
-
-def get_table_oid_map(schema_name, connection):
-    schema_oid = get_schema_oid(schema_name, connection)
-    cursor = connection.cursor()
-    cursor.execute('select relname, oid from pg_class where relnamespace=:schema', {'schema': schema_oid})
-    results = cursor.fetchall()
-    return dict(results)
-
-
-def get_table_ddl(db_name, table_name):
-    return subprocess.check_output(['pg_dump', '-t', table_name, '--schema-only', db_name])
-
-
-def build_table_path(pgdata, db_oid, table_oid):
-    return os.path.join(pgdata, 'base', str(db_oid), str(table_oid))
-
-
-def copy_table(pgdata, db_oid, table_oid, table_name, efs_root):
-    shutil.copy(build_table_path(pgdata, db_oid, table_oid), os.path.join(efs_root, 'data', table_name))
-
-
-def start_postgres(pgdata):
-    subprocess.check_call(['pg_ctl', '-D', pgdata, 'start'])
-
-
-def stop_postgres(pgdata):
-    subprocess.check_call(['pg_ctl', '-D', pgdata, 'stop'])
-
-
-def clear_cache():
-    if sys.platform == 'darwin':
-        subprocess.check_call((['sudo', 'purge']))
-    else:
-        subprocess.check_call(['sync'])
-        with open('/proc/sys/vm/drop_caches', 'w') as f:
-            f.write(1)
-
-
-def clone_db(db_name, schema_name, efs_root, connection):
-    pgdata = get_pgdata(connection)
-    db_oid = get_db_oid(db_name, connection)
-    db_path = os.path.join(efs_root, db_name)
-    os.mkdir(db_path)
-    os.mkdir(os.path.join(db_path, 'data'))
-    os.mkdir(os.path.join(db_path, 'ddl'))
-    tables = get_table_oid_map(schema_name, connection)
-    for table_name in tables:
-        with open(os.path.join(db_path, 'ddl', table_name), 'w') as f:
-            f.write(get_table_ddl(db_name, table_name))
-    connection.close()
-    stop_postgres(pgdata)
-    clear_cache()
-    for table_name, table_oid in tables.items():
-        copy_table(pgdata, db_oid, table_oid, table_name, db_path)
-
-    start_postgres(pgdata)
-
-
-def link_db(db_name, schema_name, efs_root, connection):
-    # make tables
-    for table_name in os.listdir(os.path.join(efs_root, db_name, 'ddl')):
-        with open(os.path.join(efs_root, db_name, 'ddl', table_name), 'r') as f:
-            ddl = f.read()
-        statements = []
-        current_statement = ''
-        for line in ddl.split('\n'):
-            if line.startswith('--'):
-                continue
-            current_statement += line
-            if line.endswith(';'):
-                statements.append(current_statement)
-                current_statement = ''
-        if current_statement.strip():
+def parse_script(script):
+    statements = []
+    current_statement = ''
+    for line in script.split('\n'):
+        if line.startswith('--'):
+            continue
+        current_statement += line
+        if line.endswith(';'):
             statements.append(current_statement)
-        cursor = connection.cursor()
-        for statement in statements:
-            cursor.execute(statement)
-        connection.commit()
-
-    # delete page file and link it to the efs
-    pgdata = get_pgdata(connection)
-    db_oid = get_db_oid(db_name, connection)
-    tables = get_table_oid_map(schema_name, connection)
-    connection.close()
-    stop_postgres(pgdata)
-    clear_cache()
-    for table_name, table_oid in tables.items():
-        table_path = build_table_path(pgdata, db_oid, table_oid)
-        os.unlink(table_path)
-        os.symlink(os.path.join(efs_root, db_name, 'data', table_name), table_path)
-    start_postgres(pgdata)
+            current_statement = ''
+    if current_statement.strip():
+        statements.append(current_statement)
+    return statements
 
 
-def main(db_name, schema_name, efs_root, username, password):
-    pg8000.paramstyle = 'named'
-    connection = pg8000.connect(user=username, database=db_name)
-    clone_db(db_name, schema_name, efs_root, connection)
-    # link_db(db_name, schema_name, efs_root, connection)
+class Pefs(object):
+    def __init__(self, db_name, schema_name, efs_root, pg_user, pg_pass):
+        self.db_name = db_name
+        self.schema_name = schema_name
+        self.efs_root = efs_root
+        self.pg_user = pg_user
+        self.pg_pass = pg_pass
 
-if __name__ == '__main__':
-    main('andrew', 'public', '/Users/andrew/pefs', 'andrew', '')
+        self.pgdata = None
+        self.db_oid = None
+        self.schema_oid = None
+        self.tables = None
+        self._connection = None
+
+        self.get_pgdata()
+        self.get_db_oid()
+        self.get_schema_oid()
+        self.get_tables()
+
+    def get_tables(self):
+        stmt = 'select relname, oid from pg_class where relnamespace=:schema'
+        results = self.execute(stmt, {'schema': self.schema_oid})
+        self.tables = dict(results)
+
+    def get_pgdata(self):
+        self.pgdata = self.execute('show data_directory')[0][0]
+
+    def get_schema_oid(self):
+        stmt = 'select oid from pg_namespace where nspname=:schema'
+        self.schema_oid = self.execute(stmt, {'schema': self.schema_name})[0][0]
+
+    def get_db_oid(self):
+        self.db_oid = self.execute('select oid from pg_database where datname=:db', {'db': self.db_name})[0][0]
+
+    @contextmanager
+    def get_connection(self):
+        if self._connection is None:
+            pg8000.paramstyle = 'named'
+            self._connection = pg8000.connect(user=self.pg_user, database=self.pg_pass)
+        yield self._connection
+        self._connection.commit()
+
+    def execute(self, statement, args=()):
+        with self.get_connection() as connection:
+            cursor = connection.cursor()
+            cursor.execute(statement, args)
+            result = cursor.fetchall()
+        return result
+
+    def execute_script(self, script):
+        with self.get_connection() as connection:
+            statements = parse_script(script)
+            cursor = connection.cursor()
+            for statement in statements:
+                cursor.execute(statement)
+
+    def get_table_ddl(self, table_name):
+        return subprocess.check_output(['pg_dump', '-t', table_name, '--schema-only', self.db_name])
+
+    def build_table_path(self, table_oid):
+        return os.path.join(self.pgdata, 'base', str(self.db_oid), str(table_oid))
+
+    def copy_table(self, table_name, table_oid):
+        shutil.copy(self.build_table_path(table_oid), os.path.join(self.efs_root, self.db_name, 'data', table_name))
+
+    def copy_ddl(self, table_name):
+        with open(os.path.join(self.efs_root, self.db_name, 'ddl', table_name), 'w') as f:
+            f.write(self.get_table_ddl(table_name))
+
+    def start_postgres(self):
+        subprocess.check_call(['pg_ctl', '-D', self.pgdata, 'start'])
+
+    def stop_postgres(self):
+        subprocess.check_call(['pg_ctl', '-m', 'fast', '-D', self.pgdata, 'stop'])
+
+    def clear_cache(self):
+        if sys.platform == 'darwin':
+            subprocess.check_call((['sudo', 'purge']))
+        else:
+            subprocess.check_call(['sync'])
+            with open('/proc/sys/vm/drop_caches', 'w') as f:
+                f.write(1)
+
+    @contextmanager
+    def cold_postgres(self):
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
+            time.sleep(0.5)
+        self.stop_postgres()
+        self.clear_cache()
+        yield
+        self.start_postgres()
+
+    def clone_db(self):
+        os.mkdir(os.path.join(self.efs_root, self.db_name))
+        os.mkdir(os.path.join(self.efs_root, self.db_name, 'data'))
+        os.mkdir(os.path.join(self.efs_root, self.db_name, 'ddl'))
+        for table_name in self.tables:
+            self.copy_ddl(table_name)
+
+        with self.cold_postgres():
+            for table_name, table_oid in self.tables.items():
+                self.copy_table(table_name, table_oid)
+
+    def link_db(self):
+        for table_name in os.listdir(os.path.join(self.efs_root, self.db_name, 'ddl')):
+            with open(os.path.join(self.efs_root, self.db_name, 'ddl', table_name), 'r') as f:
+                ddl = f.read()
+            self.execute_script(ddl)
+
+        self.get_tables()
+
+        with self.cold_postgres():
+            for table_name, table_oid in self.tables.items():
+                table_path = self.build_table_path(table_oid)
+                os.unlink(table_path)
+                os.symlink(os.path.join(self.efs_root, self.db_name, 'data', table_name), table_path)
